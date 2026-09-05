@@ -31,6 +31,8 @@ NUM_TO_DAY = {n: label for label, n in WEEKDAYS}
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -101,6 +103,9 @@ def parse_days(value):
 
 
 def create_course(user_id, exercise_id, schedule_days, goal_type, goal_value):
+    # A course may only be created for an exercise owned by this Telegram user.
+    if not get_exercise(user_id, exercise_id):
+        return None
     days = ",".join(str(x) for x in sorted(set(schedule_days)))
     with db() as conn:
         cur = conn.execute("""
@@ -114,7 +119,7 @@ def get_course(user_id, course_id):
     with db() as conn:
         return conn.execute("""
             SELECT c.*, e.title, e.author, e.url, e.time_slot
-            FROM courses c JOIN exercises e ON e.id=c.exercise_id
+            FROM courses c JOIN exercises e ON e.id=c.exercise_id AND e.user_id=c.user_id
             WHERE c.id=? AND c.user_id=?
         """, (course_id, user_id)).fetchone()
 
@@ -124,27 +129,33 @@ def list_courses(user_id, status):
         return conn.execute("""
             SELECT c.*, e.title, e.author, e.url, e.time_slot,
               (SELECT COUNT(*) FROM course_marks m WHERE m.course_id=c.id AND m.mark_type='done') AS done_count
-            FROM courses c JOIN exercises e ON e.id=c.exercise_id
+            FROM courses c JOIN exercises e ON e.id=c.exercise_id AND e.user_id=c.user_id
             WHERE c.user_id=? AND c.status=? ORDER BY c.created_at DESC, c.id DESC
         """, (user_id, status)).fetchall()
 
 
-def done_count(course_id):
+def done_count(user_id, course_id):
     with db() as conn:
-        return conn.execute("SELECT COUNT(*) n FROM course_marks WHERE course_id=? AND mark_type='done'", (course_id,)).fetchone()["n"]
+        return conn.execute(
+            "SELECT COUNT(*) n FROM course_marks WHERE user_id=? AND course_id=? AND mark_type='done'",
+            (user_id, course_id),
+        ).fetchone()["n"]
 
 
-def mark_for_today(course_id):
+def mark_for_today(user_id, course_id):
     with db() as conn:
-        return conn.execute("SELECT * FROM course_marks WHERE course_id=? AND mark_date=?", (course_id, date.today().isoformat())).fetchone()
+        return conn.execute(
+            "SELECT * FROM course_marks WHERE user_id=? AND course_id=? AND mark_date=?",
+            (user_id, course_id, date.today().isoformat()),
+        ).fetchone()
 
 
-def course_progress(c):
+def course_progress(user_id, c):
     if c["goal_type"] == "days":
         current = (date.today() - date.fromisoformat(c["start_date"])).days + 1
         current = max(1, min(current, c["goal_value"]))
         return f"День {current} из {c['goal_value']}"
-    return f"Выполнено {done_count(c['id'])} из {c['goal_value']}"
+    return f"Выполнено {done_count(user_id, c['id'])} из {c['goal_value']}"
 
 
 def auto_complete(user_id):
@@ -155,10 +166,13 @@ def auto_complete(user_id):
             last_day = date.fromisoformat(c["start_date"]) + timedelta(days=c["goal_value"] - 1)
             complete = today > last_day
         else:
-            complete = done_count(c["id"]) >= c["goal_value"]
+            complete = done_count(user_id, c["id"]) >= c["goal_value"]
         if complete:
             with db() as conn:
-                conn.execute("UPDATE courses SET status='completed', completed_at=? WHERE id=?", (today.isoformat(), c["id"]))
+                conn.execute(
+                    "UPDATE courses SET status='completed', completed_at=? WHERE id=? AND user_id=?",
+                    (today.isoformat(), c["id"], user_id),
+                )
 
 
 def today_courses(user_id):
@@ -173,9 +187,9 @@ def today_courses(user_id):
             last_day = start + timedelta(days=c["goal_value"] - 1)
             if today > last_day:
                 continue
-        elif done_count(c["id"]) >= c["goal_value"]:
+        elif done_count(user_id, c["id"]) >= c["goal_value"]:
             continue
-        if mark_for_today(c["id"]):
+        if mark_for_today(user_id, c["id"]):
             continue
         out.append(c)
     order = {name: i for i, name in enumerate(TIME_SLOTS)}
@@ -184,28 +198,47 @@ def today_courses(user_id):
 
 
 def save_mark(user_id, course_id, mark_type):
+    # Never write a mark until ownership of the course has been verified.
+    c = get_course(user_id, course_id)
+    if not c:
+        return False
     with db() as conn:
         conn.execute("""
             INSERT INTO course_marks(user_id,course_id,mark_date,mark_type) VALUES(?,?,?,?)
-            ON CONFLICT(course_id,mark_date) DO UPDATE SET mark_type=excluded.mark_type
+            ON CONFLICT(course_id,mark_date) DO UPDATE SET
+                user_id=excluded.user_id,
+                mark_type=excluded.mark_type
         """, (user_id, course_id, date.today().isoformat(), mark_type))
-    c = get_course(user_id, course_id)
-    if c and c["goal_type"] == "completions" and done_count(course_id) >= c["goal_value"]:
+    if c["goal_type"] == "completions" and done_count(user_id, course_id) >= c["goal_value"]:
         with db() as conn:
-            conn.execute("UPDATE courses SET status='completed', completed_at=? WHERE id=?", (date.today().isoformat(), course_id))
+            conn.execute(
+                "UPDATE courses SET status='completed', completed_at=? WHERE id=? AND user_id=?",
+                (date.today().isoformat(), course_id, user_id),
+            )
+    return True
 
 
 def set_status(user_id, course_id, status):
+    if status not in {"active", "paused", "completed"}:
+        return False
     with db() as conn:
         if status == "completed":
-            conn.execute("UPDATE courses SET status=?,completed_at=? WHERE id=? AND user_id=?", (status, date.today().isoformat(), course_id, user_id))
+            cur = conn.execute(
+                "UPDATE courses SET status=?,completed_at=? WHERE id=? AND user_id=?",
+                (status, date.today().isoformat(), course_id, user_id),
+            )
         else:
-            conn.execute("UPDATE courses SET status=?,completed_at=NULL WHERE id=? AND user_id=?", (status, course_id, user_id))
+            cur = conn.execute(
+                "UPDATE courses SET status=?,completed_at=NULL WHERE id=? AND user_id=?",
+                (status, course_id, user_id),
+            )
+        return cur.rowcount == 1
 
 
 def delete_exercise(user_id, exercise_id):
     with db() as conn:
-        conn.execute("DELETE FROM exercises WHERE id=? AND user_id=?", (exercise_id, user_id))
+        cur = conn.execute("DELETE FROM exercises WHERE id=? AND user_id=?", (exercise_id, user_id))
+        return cur.rowcount == 1
 
 
 def schedule_text(value):
@@ -304,7 +337,7 @@ async def show_today(message: Message):
         if c["time_slot"] != last_slot:
             await message.answer(f"<b>{c['time_slot']}</b>")
             last_slot = c["time_slot"]
-        await message.answer(f"<b>{c['title']}</b>\n{author_text(c['author'])}\n📆 {schedule_text(c['schedule_days'])}\n📍 {course_progress(c)}", reply_markup=today_kb(c))
+        await message.answer(f"<b>{c['title']}</b>\n{author_text(c['author'])}\n📆 {schedule_text(c['schedule_days'])}\n📍 {course_progress(message.from_user.id, c)}", reply_markup=today_kb(c))
 
 
 @dp.callback_query(F.data.startswith("done:"))
@@ -313,13 +346,15 @@ async def done(call: CallbackQuery):
     if not c: return await call.answer("Курс не найден", show_alert=True)
     save_mark(call.from_user.id, cid, "done"); c = get_course(call.from_user.id, cid)
     await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("✓ Сделано. Курс завершён." if c["status"] == "completed" else f"✓ Сделано. {course_progress(c)}")
+    await call.message.answer("✓ Сделано. Курс завершён." if c["status"] == "completed" else f"✓ Сделано. {course_progress(call.from_user.id, c)}")
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("skip:"))
 async def skip(call: CallbackQuery):
     cid = int(call.data.split(":")[1])
+    if not get_course(call.from_user.id, cid):
+        return await call.answer("Курс не найден", show_alert=True)
     save_mark(call.from_user.id, cid, "skipped")
     await call.message.edit_reply_markup(reply_markup=None)
     await call.message.answer("Сегодня пропускаем. Курс продолжается.")
@@ -334,16 +369,33 @@ async def my_courses(message: Message):
         if not items: continue
         found = True; await message.answer(f"<b>{title}</b>")
         for c in items:
-            await message.answer(f"<b>{c['title']}</b>\n{author_text(c['author'])}\n🕒 {c['time_slot']}\n📆 {schedule_text(c['schedule_days'])}\n📍 {course_progress(c)}", reply_markup=course_kb(c))
+            await message.answer(f"<b>{c['title']}</b>\n{author_text(c['author'])}\n🕒 {c['time_slot']}\n📆 {schedule_text(c['schedule_days'])}\n📍 {course_progress(message.from_user.id, c)}", reply_markup=course_kb(c))
     if not found: await message.answer("Курсов пока нет.")
 
 
 @dp.callback_query(F.data.startswith("pause:"))
-async def pause(call: CallbackQuery): set_status(call.from_user.id, int(call.data.split(":")[1]), "paused"); await call.message.answer("Курс поставлен на паузу."); await call.answer()
+async def pause(call: CallbackQuery):
+    cid = int(call.data.split(":")[1])
+    if not set_status(call.from_user.id, cid, "paused"):
+        return await call.answer("Курс не найден", show_alert=True)
+    await call.message.answer("Курс поставлен на паузу.")
+    await call.answer()
+
 @dp.callback_query(F.data.startswith("resume:"))
-async def resume(call: CallbackQuery): set_status(call.from_user.id, int(call.data.split(":")[1]), "active"); await call.message.answer("Курс снова активен."); await call.answer()
+async def resume(call: CallbackQuery):
+    cid = int(call.data.split(":")[1])
+    if not set_status(call.from_user.id, cid, "active"):
+        return await call.answer("Курс не найден", show_alert=True)
+    await call.message.answer("Курс снова активен.")
+    await call.answer()
+
 @dp.callback_query(F.data.startswith("finish:"))
-async def finish(call: CallbackQuery): set_status(call.from_user.id, int(call.data.split(":")[1]), "completed"); await call.message.answer("Курс завершён и сохранён в истории."); await call.answer()
+async def finish(call: CallbackQuery):
+    cid = int(call.data.split(":")[1])
+    if not set_status(call.from_user.id, cid, "completed"):
+        return await call.answer("Курс не найден", show_alert=True)
+    await call.message.answer("Курс завершён и сохранён в истории.")
+    await call.answer()
 
 
 @dp.message(F.text == "Библиотека")
@@ -363,7 +415,12 @@ async def delete_ask(call: CallbackQuery):
     await call.message.answer(f"Удалить «{ex['title']}» и всю историю его курсов?", reply_markup=kb); await call.answer()
 
 @dp.callback_query(F.data.startswith("deleteyes:"))
-async def delete_yes(call: CallbackQuery): delete_exercise(call.from_user.id, int(call.data.split(":")[1])); await call.message.answer("Удалено из библиотеки."); await call.answer()
+async def delete_yes(call: CallbackQuery):
+    eid = int(call.data.split(":")[1])
+    if not delete_exercise(call.from_user.id, eid):
+        return await call.answer("Комплекс не найден", show_alert=True)
+    await call.message.answer("Удалено из библиотеки.")
+    await call.answer()
 @dp.callback_query(F.data == "noop")
 async def noop(call: CallbackQuery): await call.answer("Отменено")
 
@@ -423,8 +480,14 @@ async def add_course(call: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("startcourse:"))
 async def start_course(call: CallbackQuery, state: FSMContext):
-    eid=int(call.data.split(":")[1]); await state.clear(); await state.set_state(CourseSetup.days); await state.update_data(course_exercise_id=eid,course_days=[])
-    await call.message.answer("В какие дни выполнять этот курс?",reply_markup=days_kb(set(),"course_")); await call.answer()
+    eid = int(call.data.split(":")[1])
+    if not get_exercise(call.from_user.id, eid):
+        return await call.answer("Комплекс не найден", show_alert=True)
+    await state.clear()
+    await state.set_state(CourseSetup.days)
+    await state.update_data(course_exercise_id=eid, course_days=[])
+    await call.message.answer("В какие дни выполнять этот курс?", reply_markup=days_kb(set(), "course_"))
+    await call.answer()
 
 @dp.callback_query(CourseSetup.days, F.data.startswith("course_day:"))
 async def course_day(call: CallbackQuery, state: FSMContext):
@@ -451,8 +514,14 @@ async def course_value(message: Message, state: FSMContext):
     try:
         value=int((message.text or "").strip()); assert value>0
     except: return await message.answer("Пришли положительное целое число.")
-    data=await state.get_data(); cid=create_course(message.from_user.id,data["course_exercise_id"],data["course_days"],data["course_goal_type"],value); c=get_course(message.from_user.id,cid); await state.clear()
-    await message.answer(f"Курс начат ✓\n\n<b>{c['title']}</b>\n📆 {schedule_text(c['schedule_days'])}\n📍 {course_progress(c)}",reply_markup=main_kb)
+    data = await state.get_data()
+    cid = create_course(message.from_user.id, data["course_exercise_id"], data["course_days"], data["course_goal_type"], value)
+    if not cid:
+        await state.clear()
+        return await message.answer("Не удалось начать курс: комплекс не найден.", reply_markup=main_kb)
+    c = get_course(message.from_user.id, cid)
+    await state.clear()
+    await message.answer(f"Курс начат ✓\n\n<b>{c['title']}</b>\n📆 {schedule_text(c['schedule_days'])}\n📍 {course_progress(message.from_user.id, c)}",reply_markup=main_kb)
 
 
 @dp.callback_query(F.data.startswith("restart:"))
@@ -487,8 +556,14 @@ async def re_value(message: Message, state: FSMContext):
     try:
         value=int((message.text or "").strip()); assert value>0
     except: return await message.answer("Пришли положительное целое число.")
-    data=await state.get_data(); cid=create_course(message.from_user.id,data["re_exercise_id"],data["re_days"],data["re_goal_type"],value); c=get_course(message.from_user.id,cid); await state.clear()
-    await message.answer(f"Новый курс начат ✓\n\n<b>{c['title']}</b>\n📆 {schedule_text(c['schedule_days'])}\n📍 {course_progress(c)}",reply_markup=main_kb)
+    data = await state.get_data()
+    cid = create_course(message.from_user.id, data["re_exercise_id"], data["re_days"], data["re_goal_type"], value)
+    if not cid:
+        await state.clear()
+        return await message.answer("Не удалось начать новый курс: комплекс не найден.", reply_markup=main_kb)
+    c = get_course(message.from_user.id, cid)
+    await state.clear()
+    await message.answer(f"Новый курс начат ✓\n\n<b>{c['title']}</b>\n📆 {schedule_text(c['schedule_days'])}\n📍 {course_progress(message.from_user.id, c)}",reply_markup=main_kb)
 
 
 @dp.message(F.text == "Настройки")
